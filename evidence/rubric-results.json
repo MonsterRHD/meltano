@@ -12,17 +12,17 @@
   {
     "id": 3,
     "passed": false,
-    "reason": "_move_path 在 EXDEV 分支先 copytree 到公开目标，再 rmtree 源目录。"
+    "reason": "跨设备移动分支先复制到公开目标，再删除源目录。"
   },
   {
     "id": 4,
     "passed": false,
-    "reason": "_rollback 捕获 OSError 后只记 critical 日志；外层清理仍删除 journal。"
+    "reason": "回滚捕获操作系统错误后只记录严重日志；外层清理仍删除日志记录。"
   },
   {
     "id": 5,
     "passed": false,
-    "reason": "EXDEV fallback 通过 copytree/rmtree 逐项复制，没有原子 rename 替换目标的步骤。"
+    "reason": "跨设备回退通过逐项复制和删除完成，没有原子替换目标的步骤。"
   },
   {
     "id": 6,
