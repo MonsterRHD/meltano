@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": false,
+    "reason": "remove commit 由配置、lock、cache 等多次文件操作组成；rollback 异常只记录，journal 清理仍可继续。"
+  },
+  {
+    "id": 4,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 5,
+    "passed": false,
+    "reason": "清理错误被记录后结果仍从 managers 状态返回，没有将失败资源及待续做状态反映到调用结果。"
+  },
+  {
+    "id": 6,
+    "passed": false,
+    "reason": "_finish_commit_steps 以缺失文件和 moved journal 标记推断清理完成；文件移动与 journal 更新分属不同操作。"
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 8,
+    "passed": true,
+    "reason": ""
+  }
+]

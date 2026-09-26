@@ -1,0 +1,21 @@
+项目 project-08｜题目 meltano-meltano-bc627d59-15ca-4b9f-92be-0abf3b084c71
+Prompt-Rubric 对齐审计：逐条核对冻结 Rubric 与原始中文 Prompt 的场景、目标、失败边界、兼容描述；以下每项引用原 Prompt 已明确的可观察目标。未发现新增接口、文件、错误码、部署或测试夹具门槛。
+P-R 对齐表：
+R1 → Prompt 场景/目标原文“修正移除流程”：移除前解析所有有效 environment 视图，并列出 job、schedule 和插件继承中的真实引用。
+R2 → Prompt 场景/目标原文“修正移除流程”：存在任何阻断引用时命令不修改项目定义、lock、虚拟环境或生成文件。
+R3 → Prompt 场景/目标原文“修正移除流程”：可移除时项目定义、lock 和相关缓存以版本校验的一次提交更新，不留下相互矛盾视图。
+R4 → Prompt 场景/目标原文“修正移除流程”：共享文件或仍被其他插件引用的制品不会删除，插件专属资源才进入清理。
+R5 → Prompt 场景/目标原文“修正移除流程”：配置提交后的虚拟环境或文件清理失败会返回部分完成状态，并可用同一操作继续。
+R6 → Prompt 场景/目标原文“修正移除流程”：进程在提交或清理阶段崩溃后，可从持久日志完成剩余清理而不重新删除配置。
+R7 → Prompt 场景/目标原文“不存在的插件保持既有幂等结果，dry-run 只报告，不改变项目”：确认期间配置变化会阻止陈旧计划提交并要求重新校验引用。
+R8 → Prompt 场景/目标原文“不存在的插件保持既有幂等结果，dry-run 只报告，不改变项目”：不存在插件维持既有幂等结果，dry-run 只报告完整计划且不写项目或磁盘。
+验证摘要：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。
+逐条比较（按冻结 Rubric 顺序）：
+Rubric ID：1｜状态：通过｜期望行为：移除前解析所有有效 environment 视图，并列出 job、schedule 和插件继承中的真实引用。｜实际观察：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。｜直接证据：src/meltano/core/plugin_remove_service.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。
+Rubric ID：2｜状态：通过｜期望行为：存在任何阻断引用时命令不修改项目定义、lock、虚拟环境或生成文件。｜实际观察：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。｜直接证据：src/meltano/core/plugin_remove_service.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。
+Rubric ID：3｜状态：未通过｜期望行为：可移除时项目定义、lock 和相关缓存以版本校验的一次提交更新，不留下相互矛盾视图。｜实际观察：remove commit 由配置、lock、cache 等多次文件操作组成；rollback 异常只记录，journal 清理仍可继续。｜直接证据：src/meltano/core/plugin_remove_service.py；rollback/finalize 路径｜原因：remove commit 由配置、lock、cache 等多次文件操作组成；rollback 异常只记录，journal 清理仍可继续。｜影响：清理错误后配置与 lock/cache 可能留在不同提交状态，且 journal 不再提供完整恢复依据。｜证据位置：src/meltano/core/plugin_remove_service.py；rollback/finalize 路径
+Rubric ID：4｜状态：通过｜期望行为：共享文件或仍被其他插件引用的制品不会删除，插件专属资源才进入清理。｜实际观察：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。｜直接证据：src/meltano/core/plugin_remove_service.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。
+Rubric ID：5｜状态：未通过｜期望行为：配置提交后的虚拟环境或文件清理失败会返回部分完成状态，并可用同一操作继续。｜实际观察：清理错误被记录后结果仍从 managers 状态返回，没有将失败资源及待续做状态反映到调用结果。｜直接证据：src/meltano/core/plugin_remove_service.py；cleanup 错误分支｜原因：清理错误被记录后结果仍从 managers 状态返回，没有将失败资源及待续做状态反映到调用结果。｜影响：调用方收到结果时无法根据返回值识别未完成清理并定位资源。｜证据位置：src/meltano/core/plugin_remove_service.py；cleanup 错误分支
+Rubric ID：6｜状态：未通过｜期望行为：进程在提交或清理阶段崩溃后，可从持久日志完成剩余清理而不重新删除配置。｜实际观察：_finish_commit_steps 以缺失文件和 moved journal 标记推断清理完成；文件移动与 journal 更新分属不同操作。｜直接证据：src/meltano/core/plugin_remove_service.py；_finish_commit_steps｜原因：_finish_commit_steps 以缺失文件和 moved journal 标记推断清理完成；文件移动与 journal 更新分属不同操作。｜影响：进程在移动后、journal 更新前退出时，恢复路径依赖文件状态猜测步骤，缺少幂等故障用例证明不会重复删除。｜证据位置：src/meltano/core/plugin_remove_service.py；_finish_commit_steps
+Rubric ID：7｜状态：通过｜期望行为：确认期间配置变化会阻止陈旧计划提交并要求重新校验引用。｜实际观察：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。｜直接证据：src/meltano/core/plugin_remove_service.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。
+Rubric ID：8｜状态：通过｜期望行为：不存在插件维持既有幂等结果，dry-run 只报告完整计划且不写项目或磁盘。｜实际观察：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。｜直接证据：src/meltano/core/plugin_remove_service.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q tests/meltano/core/test_plugin_remove_service.py tests/meltano/cli/test_remove.py：30 passed，1.00s。

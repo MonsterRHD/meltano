@@ -8,6 +8,7 @@ import pytest
 from asserts import assert_cli_runner
 from meltano.cli import cli
 from meltano.core.plugin import PluginType
+from meltano.core.plugin_remove_service import PluginReference, PluginRemoveBlockedError
 from meltano.core.project_add_service import PluginAlreadyAddedException
 
 if t.TYPE_CHECKING:
@@ -94,3 +95,49 @@ class TestCliRemove:
             assert_cli_runner(result)
 
             remove_plugins_mock.assert_called_once_with(project, [tap, tap_gitlab])
+
+    def test_remove_dry_run(
+        self,
+        project,
+        tap,
+        cli_runner,
+    ) -> None:
+        with mock.patch("meltano.cli.remove.remove_plugins") as remove_plugins_mock:
+            result = cli_runner.invoke(
+                cli,
+                ["remove", "--dry-run", f"--plugin-type={tap.type.value}", tap.name],
+            )
+            assert_cli_runner(result)
+
+            remove_plugins_mock.assert_called_once_with(
+                project,
+                [tap],
+                dry_run=True,
+            )
+
+    def test_remove_blocked_exits_nonzero(
+        self,
+        tap,
+        cli_runner,
+    ) -> None:
+        blocked = PluginRemoveBlockedError(
+            {
+                f"{tap.type.descriptor} '{tap.name}'": [
+                    PluginReference("job", "daily-sync"),
+                ],
+            },
+        )
+        with mock.patch(
+            "meltano.cli.remove.PluginRemoveService.remove_plugins",
+            side_effect=blocked,
+        ):
+            result = cli_runner.invoke(
+                cli,
+                ["remove", f"--plugin-type={tap.type.value}", tap.name],
+            )
+
+        # `MeltanoError` is converted to exit code 1 by the CLI entrypoint;
+        # under the test runner the original exception is surfaced.
+        assert isinstance(result.exception, PluginRemoveBlockedError)
+        assert result.exception.exit_code() == 1
+        assert "daily-sync" in str(result.exception)

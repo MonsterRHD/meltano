@@ -1441,17 +1441,23 @@ Specifically, [plugins](/concepts/plugins#project-plugins) will be removed from 
 - `plugin_settings` table in the [system database](/concepts/project#system-database)
 - `./plugins/<plugin type>/` lock file directory
 
+Before changing anything, `meltano remove` builds a reference plan across all of your [Meltano Environments](https://docs.meltano.com/concepts/environments) and refuses to remove a plugin that is still referenced by a [job](/concepts/plugin-management#orchestration), [schedule](/concepts/orchestration#schedules), environment plugin configuration, or another plugin that inherits from it. Remove or update the references first. Once unblocked, the project definition, lock files, settings, and plugin cache are updated as one recoverable transaction; shared artifacts (for example, the virtual environment of a parent plugin reused by an inherited plugin) are kept. The virtual environment and other generated files are cleaned up afterwards. If that cleanup is interrupted, rerunning the same command resumes it.
+
 ### How to Use
 
 ```bash
 # Plugin type is automatically inferred
 meltano remove <name>
 meltano remove <name> <name_two>
+
+# Preview what would be removed, and see any blocking references,
+# without changing the project
+meltano remove --dry-run <name>
 ```
 
 ### Using `remove` with Environments
 
-The `remove` command does not run relative to a [Meltano Environment](https://docs.meltano.com/concepts/environments). The `--environment` flag and [`default_environment` setting](https://docs.meltano.com/concepts/environments#default-environments) in your `meltano.yml` file will be ignored if set.
+The `remove` command does not run relative to a [Meltano Environment](https://docs.meltano.com/concepts/environments). The `--environment` flag and [`default_environment` setting](https://docs.meltano.com/concepts/environments#default-environment) in your `meltano.yml` file will be ignored if set. Note that plugin configuration defined inside environments is still included in the reference plan and blocks removal until it is deleted.
 
 ### Examples
 
