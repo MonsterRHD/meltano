@@ -361,6 +361,342 @@ index 000000000..b9d467169
 +  - `rule` TR-8.1: 受影响测试全部通过（允许标记 slow 的用例按需运行，结果记录）；证据：pytest 输出
 +  - `rule` TR-8.2: `nox -t lint` 等价的 ruff 检查与 `nox -s typing` 类型检查零错误；证据：命令输出
 +  - `rubric` TR-8.3: 测试覆盖质量；scale 1-5；anchors 1 = 仅 happy path，3 = 主路径覆盖，5 = 成功/失败/重启/配置变更/并发/离线/dry-run 全覆盖；threshold >= 4；证据：测试清单与评审
+diff --git a/evidence/model.patch b/evidence/model.patch
+new file mode 100644
+index 000000000..977de34a1
+--- /dev/null
++++ b/evidence/model.patch
+@@ -0,0 +1,329 @@
++diff --git a/.trae/specs/install-transaction/spec.md b/.trae/specs/install-transaction/spec.md
++new file mode 100644
++index 000000000..290de7919
++--- /dev/null
+++++ b/.trae/specs/install-transaction/spec.md
++@@ -0,0 +1,182 @@
+++# Meltano 插件安装事务化 - Product Requirements Document
+++
+++## Overview
+++- **Summary**: 将 `meltano install` 的插件安装过程改造为带身份的事务：先根据当前项目配置与 lock 解析出确定性的安装计划，在隔离暂存目录中完成依赖安装与可执行性检查，再以原子切换提交 venv 与已提交状态记录（含 lock/manifest 视图）；任何步骤失败都保留上一个可运行版本并留下可识别的恢复记录。
+++- **Purpose**: 修复升级插件时中断 `meltano install` 导致「半成品虚拟环境 + 已更新 lock + 旧项目清单」混用的问题，使安装可恢复、可并发、可离线、可预演。
+++- **Target Users**: 在本地、CI 与生产环境中运行 `meltano install` / `meltano upgrade` 的数据工程师，以及自动触发安装（`run`/`elt`/`invoke` 的 AUTO 安装）的所有用户。
+++
+++## Goals
+++- 安装的每一步要么完整提交，要么完全不影响当前可运行版本。
+++- 进程崩溃/重启后能自动复用同计划暂存物、清理过期暂存物，并可从中断的切换中恢复。
+++- 同一插件的跨进程并发安装只有一个提交者；不同插件仍可完全并行。
+++- 支持 `--dry-run`（不写磁盘）、快速路径（无变更时不执行 pip）、离线模式（只用已锁定且本地可用制品）。
+++- 所有失败都给出可识别的恢复记录与可操作（user-actionable）的错误信息。
+++
+++## Non-Goals
+++- 不改变 `meltano compile` 生成 manifest 的方式，不新增独立的 manifest 快照文件（已确认：视图以「已提交状态记录」形式落地）。
+++- 不改变插件运行时定位 venv 的路径约定（`.meltano/<plugin_type>/<plugin_dir_name>/venv`）。
+++- 不重构 lock 文件的磁盘格式与 `meltano lock` 的写入逻辑；事务只读取/快照 lock 内容。
+++- 不引入分布式锁或跨主机并发协调；并发范围限定为同一项目文件系统上的进程。
+++- File 类型插件（无 venv）的 `after_install` 文件写入不纳入暂存事务，仍在提交后按现有 hook 机制执行。
+++
+++## Background & Context
+++- 当前 [plugin_install_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/plugin_install_service.py) 的 `install_pip_plugin` 通过 `VirtualEnvService.from_plugin` 直接在最终位置 `.meltano/<type>/<name>/venv` 原地执行 `uv/pip install`，指纹文件 `.meltano_plugin_fingerprint` 在安装最后才写入；中途中断会留下损坏 venv。
+++- Lock 位于项目根 `plugins/<type>/<name>[--<variant>].lock`（见 [project_dirs_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/project_dirs_service.py)），由 [plugin_lock_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/plugin_lock_service.py) 读写；venv 与 lock 之间没有任何事务关联或一致性记录。
+++- 进程内重复插件已由 `PluginInstallService.remove_duplicates` 按 venv 去重；跨进程没有任何互斥。
+++- 项目已依赖 `fasteners`（进程间锁、读写锁）与 `structlog`；AGENTS.md 要求新核心功能以新服务类承载、完整类型标注、子类化 `MeltanoError` 提供可操作信息、注意 asyncio 开销。
+++- 已确认的用户决策：
+++  1. 提交视图 = 已提交状态 JSON（计划身份、venv 指纹、pip args、lock 内容哈希与快照），与 venv 原子切换；
+++  2. 离线入口 = 新增 `--offline` CLI 选项 + `MELTANO_OFFLINE` 环境变量；
+++  3. 暂存 venv 在下次运行时「同计划复用、过期清理」；恢复记录持久保留，直到被后续成功安装标记为 superseded 或用户手动删除。
+++
+++## Functional Requirements
+++- **FR-1 安装计划解析**：安装开始前，根据当前项目的 `ProjectPlugin`（type、name/plugin_dir_name、variant、pip_url、python）与当前 lock 内容解析出 `InstallPlan`，包含确定性的 `plan_id`、解析后的 pip install args、lock 内容快照及其哈希、解释器与创建时间。
+++- **FR-2 计划身份**：`plan_id` 对相同输入稳定；pip args、variant、lock 内容、python 解释器中任一变化都会产生不同 `plan_id`。
+++- **FR-3 隔离暂存**：venv 创建与依赖安装只发生在 `.meltano/<type>/<name>/staging/<plan_id>/` 下；提交前最终 venv 路径与其状态记录不被修改。
+++- **FR-4 可执行性检查**：暂存安装完成后、提交前必须验证：暂存 venv 的 python 可运行、插件可执行文件存在且可执行、以插件可执行文件发起一次探测（`--help`，带超时）成功；任一不满足则安装失败。
+++- **FR-5 原子提交**：通过同文件系统内的 rename 交换，将暂存 venv 切换到最终 venv 路径，并将候选「已提交状态记录」原子写入 `install.json`；提交后状态记录与 venv 指纹均指向该计划。
+++- **FR-6 失败保留旧版本**：计划解析之后任一步骤失败，最终 venv 与 `install.json` 仍指向上一个已提交的可运行版本；不提交半成品。
+++- **FR-7 恢复记录**：失败时写出机器可识别的恢复记录（位于 `recovery/`），至少含 `plan_id`、插件身份、失败阶段与原因、时间戳、暂存路径、上一个已提交计划标识与恢复建议。
+++- **FR-8 重启恢复**：开始某插件安装前扫描其暂存区：属于当前计划的暂存物予以复用（已完成可执行性检查的可直接进入提交；未完成的继续安装）；属于其他计划或损坏的暂存物予以清理；发现切换中途残留（如备份 venv）时恢复到上一可运行版本或完成切换。
+++- **FR-9 配置变更检测**：获得提交权后、真正切换前重新基于当前项目与 lock 解析计划；若当前 `plan_id` 与暂存计划不一致，拒绝提交旧计划、保留当前版本并写恢复记录。
+++- **FR-10 并发控制**：同一插件的跨进程安装通过 per-plugin 进程间锁串行化，且只有一个提交者；后到者提交前重新检查——若目标计划已被提交则走 SKIPPED 快速路径，若计划冲突则按 FR-9 拒绝；不同插件使用各自独立的锁，互不阻塞、并行安装。
+++- **FR-11 dry-run**：解析计划并报告每个插件「将安装/将跳过」及原因，不创建、不修改任何文件与目录。
+++- **FR-12 快速路径**：当 `install.json` 已提交记录的 `plan_id` 与当前解析计划一致、venv 的 python 存在且指纹匹配时，直接 SKIPPED，不创建暂存目录、不执行 pip。
+++- **FR-13 离线模式**：离线时不从 Hub 获取任何定义（lock 缺失即快速失败并给出可操作错误）；依赖安装只使用计划中已锁定且本地可用的制品——uv 后端使用 `--offline`，pip 后端使用 `--no-index`（可选 `--find-links`）；制品本地不可用时失败并保留旧版本。
+++- **FR-14 兼容旧项目**：没有 `install.json` 的既有项目视为「无已提交状态」，执行一次正常安装后建立状态记录；旧指纹文件 `.meltano_plugin_fingerprint` 继续被读取写入，运行时行为不变。
+++- **FR-15 hook 兼容**：`install` hooks（含 File 插件 `after_install`）在新版本成功提交后按现有语义触发；hooks 失败不回滚已提交的 venv，但产生 WARNING 状态（与当前语义一致）。
+++
+++## Non-Functional Requirements
+++- **NFR-1 性能**：快速路径与 dry-run 不得产生 pip/uv 子进程；暂存复用避免重复下载与安装；注意 asyncio 开销（参考 AGENTS.md 引用的 PR #9724），不为每插件引入多余锁轮询。
+++- **NFR-2 跨平台**：原子操作使用 `os.replace`/同卷 rename 语义，兼容 macOS、Linux 与 Windows（Windows 下 venv 目录切换要求无进程占用）。
+++- **NFR-3 可观测性**：所有阶段（解析、暂存、检查、提交、恢复）通过 `structlog` 输出结构化日志，携带 `plugin_type`、`plugin_name`、`plan_id`、阶段字段；恢复记录路径在日志中可见。
+++- **NFR-4 可维护性**：以职责单一的新服务类承载（计划解析、暂存构建、提交、恢复），全部新代码带完整类型标注并通过 `mypy`/`ty`、`ruff`。
+++- **NFR-5 可测试性**：外部子进程与 Hub 访问可 mock；测试组织镜像源码结构，关键路径（失败保留、重启恢复、配置变更、并发、离线、dry-run）均有自动化测试。
+++
+++## Constraints
+++- **Technical**: Python 3.10+；仅使用现有依赖（`fasteners`、`structlog`、`uv` 后端、`virtualenv` 后端）；不新增第三方依赖；遵循 `from __future__ import annotations` 与项目导入规范。
+++- **Business**: 不破坏 `meltano install/upgrade/add/run/elt/invoke/config/validate` 的现有 CLI 契约（新增选项必须有默认值且向后兼容）。
+++- **Dependencies**: lock 内容来自 `PluginLockService`；插件来自 `ProjectPluginsService`；venv 构建基于 `VirtualEnvService`/`VenvBackend`。
+++
+++## Assumptions
+++- `.meltano` 与其 staging 目录位于同一文件系统，rename 为原子操作；若 `MELTANO_SYS_DIR_ROOT` 指向其他卷导致跨文件系统，提交器回退为「复制 + 校验」并在日志中标注（非原子窗口最小化），且测试覆盖同卷主路径。
+++- 可执行性探测统一使用 `--help`；不响应 `--help` 的插件属极少数，探测失败信息会说明如何报告问题。默认探测，不提供用户配置面（保持变更最小）。
+++- `MELTANO_OFFLINE` 真值语义：`1/true/yes/on`（大小写不敏感）视为离线。
+++- 恢复记录被后续成功安装标记为 `superseded` 而非删除，以满足「可识别、持久」要求。
+++
+++## Acceptance Criteria
+++
+++### AC-1: 安装计划具有确定性身份
+++- **Type**: `rule`
+++- **Given**: 同一项目的同一插件与同一份 lock 内容
+++- **When**: 连续两次解析安装计划
+++- **Then**: 两次得到相同的 `plan_id`，且 pip args、lock 哈希一致
+++- **Pass Condition**: 相同输入 `plan_id` 相等；改动 pip_url/variant/lock 内容/python 中任一项后 `plan_id` 改变
+++- **Evidence**: `tests/meltano/core/test_install_plan_service.py`（或对应镜像路径）中参数化用例断言
+++
+++### AC-2: 依赖安装只发生在隔离暂存目录
+++- **Type**: `rule`
+++- **Given**: 插件存在已提交 venv，触发一次需要变更的安装
+++- **When**: 依赖安装阶段执行（mock pip/uv）
+++- **Then**: 安装命令的目标根路径为 `staging/<plan_id>/venv`；最终 venv 目录内容与状态记录在提交前未被修改
+++- **Pass Condition**: 断言 pip/uv 调用目标为暂存路径，且提交前最终 venv 路径 mtime/内容快照不变
+++- **Evidence**: 单元测试中对后端调用参数与最终路径快照的断言
+++
+++### AC-3: 提交前必须通过可执行性检查
+++- **Type**: `rule`
+++- **Given**: 暂存 venv 已完成依赖安装
+++- **When**: 分别构造「python 可运行」「可执行文件缺失」「探测退出非 0」三种暂存环境
+++- **Then**: 仅全部检查通过才进入提交；其余情况安装失败且不切换
+++- **Pass Condition**: 三种失败构造均产生 ERROR 状态、最终 venv 不变，且不产生新的 `install.json`
+++- **Evidence**: 可执行性检查服务单元测试（用真实临时 venv + 伪造可执行脚本）
+++
+++### AC-4: 提交为 venv 与状态记录的原子切换
+++- **Type**: `rule`
+++- **Given**: 暂存 venv 通过全部检查
+++- **When**: 提交执行
+++- **Then**: 最终 venv 路径内容等于暂存 venv，`install.json` 记录该 `plan_id`、pip args、lock 哈希与指纹；venv 指纹与记录一致
+++- **Pass Condition**: 提交后 venv python 可运行、指纹 == 计划指纹、`install.json` 反序列化字段全部匹配
+++- **Evidence**: 提交器单元测试 + 提交后 `VirtualEnv.read_fingerprint` 断言
+++
+++### AC-5: 任一步失败保留上一可运行版本并写恢复记录
+++- **Type**: `rule`
+++- **Given**: 插件存在已提交的可运行版本（`install.json` + venv）
+++- **When**: 在「依赖安装」「可执行性检查」「切换」阶段分别注入失败
+++- **Then**: 最终 venv 与 `install.json` 仍指向上一个 `plan_id` 且 python 可运行；`recovery/` 下新增含 plan_id/阶段/原因/时间戳/暂存路径/上一计划的记录
+++- **Pass Condition**: 三阶段注入失败后旧版本可运行、旧状态记录不变，且恢复记录字段完整可解析
+++- **Evidence**: 事务编排服务参数化失败注入测试
+++
+++### AC-6: 进程重启后复用同计划暂存物、清理过期暂存物
+++- **Type**: `rule`
+++- **Given**: 暂存目录下分别存在「与当前计划同 plan_id 且构建完整」「同 plan_id 构建不完整」「不同 plan_id」三种暂存物，以及一组切换中途残留（venv 已改名备份、新 venv 未就位）
+++- **When**: 新进程开始该插件安装
+++- **Then**: 完整同计划暂存物被复用并直接进入提交；不完整同计划暂存物继续安装；不同计划暂存物被删除；切换残留被恢复为上一可运行版本
+++- **Pass Condition**: 四种情形分别断言（复用无重复 pip 安装调用、继续安装发生、过期目录不存在、恢复后旧 venv 就位且可运行）
+++- **Evidence**: 恢复协调器单元测试
+++
+++### AC-7: 等待期间配置改变则拒绝提交旧计划
+++- **Type**: `rule`
+++- **Given**: 暂存计划 P1 已构建完成；提交前项目配置或 lock 被改变，使当前解析计划为 P2
+++- **When**: P1 的提交器执行提交前复检
+++- **Then**: 提交被拒绝，当前版本保持不变，写出指向 P1 的恢复记录（原因含「计划已过期」）
+++- **Pass Condition**: venv/`install.json` 不变、暂存保留并记录、状态为 ERROR 且错误可操作
+++- **Evidence**: 提交器 stale-plan 测试
+++
+++### AC-8: 同插件单提交者、不同插件并行
+++- **Type**: `rule`
+++- **Given**: 两个进程同时安装同一插件（相同/不同计划各一组），以及两个进程分别安装不同插件
+++- **When**: 并发执行安装
+++- **Then**: 同插件只有一个提交发生；第二个提交者发现已提交则 SKIPPED，计划冲突则拒绝；不同插件两者均成功提交且互不等待
+++- **Pass Condition**: 同插件最终只有一个 `install.json` 提交者（另一状态为 SKIPPED/ERROR），不同插件用例总耗时接近单次安装（锁不交叉）
+++- **Evidence**: 使用 per-plugin 锁的并发测试（asyncio + 线程/子进程模拟跨进程）
+++
+++### AC-9: dry-run 不写磁盘
+++- **Type**: `rule`
+++- **Given**: 任意项目状态
+++- **When**: 以 dry-run 运行安装
+++- **Then**: 输出每个插件的计划动作与原因；项目目录（含 `.meltano`、`plugins/`）前后文件树完全一致，且无子进程产生
+++- **Pass Condition**: 目录树 diff 为空、pip/uv 调用为零
+++- **Evidence**: CLI/服务级 dry-run 测试（前后快照对比）
+++
+++### AC-10: 无变更时保持快速路径
+++- **Type**: `rule`
+++- **Given**: `install.json` 的 `plan_id` 与当前计划一致、venv python 存在、指纹匹配
+++- **When**: 以任意 reason 运行安装
+++- **Then**: 状态为 SKIPPED，无暂存目录创建、无 pip/uv 子进程
+++- **Pass Condition**: 无后端调用、状态 SKIPPED 且消息说明无需变更
+++- **Evidence**: 快速路径单元测试
+++
+++### AC-11: 离线模式只使用已锁定且本地可用制品
+++- **Type**: `rule`
+++- **Given**: 离线标志生效
+++- **When**: 分别执行「lock 已存在且制品在本地缓存/路径可用」「lock 缺失」「制品本地不可用」三种场景
+++- **Then**: 无 Hub/网络访问；uv 调用含 `--offline` 或 pip 调用含 `--no-index`；lock 缺失与制品不可用均快速失败、旧版本保留并给可操作错误
+++- **Pass Condition**: 断言后端参数、无 Hub 调用、失败场景旧版本不变
+++- **Evidence**: 离线解析与构建参数单元测试
+++
+++### AC-12: 失败错误信息可操作性
+++- **Type**: `rubric`
+++- **Dimension**: 错误信息是否说明失败原因并给出用户可执行的下一步（重试/清理暂存/移除离线/检查 lock）
+++- **Scale**: 1-5
+++- **Anchors**: 1 = 裸异常、无上下文；3 = 说明原因但无下一步；5 = 原因 + 明确下一步 + 相关路径/计划标识
+++- **Pass Threshold**: >= 4
+++- **Evidence**: 审查所有新定义错误类与失败用例的 message/instruction 文本
+++
+++### AC-13: 服务设计与代码质量
+++- **Type**: `rubric`
+++- **Dimension**: 新服务类职责单一、与现有核心风格一致、类型标注完整、无多余 asyncio 开销
+++- **Scale**: 1-5
+++- **Anchors**: 1 = 逻辑堆叠在既有方法中、无类型；3 = 有拆分但边界模糊；5 = 解析/暂存/提交/恢复职责清晰、全标注、通过 lint 与类型检查
+++- **Pass Threshold**: >= 4
+++- **Evidence**: 代码结构评审 + `nox -t lint` 与 `nox -s typing` 结果
+++
+++### AC-14: 自动化测试覆盖关键事务路径
+++- **Type**: `rubric`
+++- **Dimension**: 测试覆盖 AC-1~AC-11 的关键路径且测试稳定（无真实网络、子进程可 mock）
+++- **Scale**: 1-5
+++- **Anchors**: 1 = 仅 happy path；3 = 主要路径覆盖但失败/恢复缺失；5 = 成功、各阶段失败、重启、配置变更、并发、离线、dry-run 全覆盖且通过
+++- **Pass Threshold**: >= 4
+++- **Evidence**: 新增/修改测试清单与 `pytest` 运行结果
+++
+++## Open Questions
+++- 无（三个关键设计点已经用户确认；其余按 Assumptions 执行）。
++diff --git a/.trae/specs/install-transaction/tasks.md b/.trae/specs/install-transaction/tasks.md
++new file mode 100644
++index 000000000..b9d467169
++--- /dev/null
+++++ b/.trae/specs/install-transaction/tasks.md
++@@ -0,0 +1,169 @@
+++# Meltano 插件安装事务化 - Implementation Plan
+++
+++实现以新包 `src/meltano/core/install_transaction/` 承载，职责拆分为 paths / plan / staging / commit / recovery / orchestration；测试镜像至 `tests/meltano/core/install_transaction/`。每任务包含随片测试。
+++
+++## Task 1: 事务路径布局（install_transaction.paths）
+++- **Status**: `completed`
+++- **Completion Evidence**:
+++  - TR-1.1/1.2/1.3 pass: `tests/meltano/core/install_transaction/test_paths.py` 5/5 通过；venv 路径 == `project.dirs.venvs(...)`，默认无触盘，ensure_layout 幂等。
+++  - 新增 [paths.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/paths.py) 与包 `__init__.py`。
+++- **Priority**: high
+++- **Depends On**: None
+++- **Description**:
+++  - 新建包 `src/meltano/core/install_transaction/__init__.py` 与 `paths.py`，实现 `InstallPaths`：基于 `project.dirs` 给出插件事务根 `.meltano/<type>/<plugin_dir_name>/` 下的：
+++    - `venv`（最终 venv，路径与现状一致）
+++    - `state_path` → `install.json`
+++    - `staging_root` → `staging/`；`staging_dir(plan_id)` → `staging/<plan_id>/`，其下 `venv`、`plan_file`（plan.json）、`candidate_state`（install.json）、`markers`（阶段标记）
+++    - `recovery_root` → `recovery/`；`recovery_record_path(plan_id)`
+++    - `locks_dir` → `locks/`；`commit_lock_path`
+++    - 切换备份名 `venv_backup`（含旧 plan_id）
+++  - 所有路径默认 `make_dirs=False`（dry-run 友好），需要时由调用方显式创建；提供 `ensure_layout()` 仅创建非 dry-run 所需目录。
+++  - 在 [project_dirs_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/project_dirs_service.py) 不新增破坏性方法，路径逻辑全部收敛在新包。
+++- **Acceptance Criteria Addressed**: AC-2, AC-4, AC-5
+++- **Test Requirements**:
+++  - `rule` TR-1.1: 给定项目与插件，`InstallPaths` 各路径字符串与现有约定一致（venv == `project.dirs.venvs(type, dir_name)`），且默认不创建任何目录；证据：路径断言 + `exists()` 全 False
+++  - `rule` TR-1.2: `ensure_layout()` 后 staging/recovery/locks 父目录存在；证据：临时项目中目录存在性断言
+++  - `rule` TR-1.3: 两个不同插件生成的锁/暂存根路径互不相同；证据：对比断言
+++
+++## Task 2: 安装计划模型与解析服务（plan.py）
+++- **Status**: `completed`
+++- **Completion Evidence**:
+++  - TR-2.1~2.4 pass: `tests/meltano/core/install_transaction/test_plan.py` 18/18 通过；plan_id 确定性与 pip_url/variant/python/lock 变更敏感性、offline 无 Hub 调用且缺 lock 抛 InstallResolutionError、JSON 往返、MELTANO_OFFLINE 真值均验证。
+++  - 新增 [plan.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/plan.py) 与 [errors.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/errors.py)。
+++- **Priority**: high
+++- **Depends On**: Task 1
+++- **Description**:
+++  - 实现 frozen dataclass `InstallPlan`：plan_id、plugin 身份（type、name、plugin_dir_name、variant、namespace）、python、pip_install_args、lock_content（dict 快照）、lock_hash、reason、created_at、meltano 版本；提供 `canonical()`/序列化与 `fingerprint`（复用 `venv_service.fingerprint`）。
+++  - 实现 `InstallPlanService`：
+++    - `resolve(plugin, reason, *, offline=False) -> InstallPlan`：pip args 复用 `get_pip_install_args`（传入 `plugin_installation_env` 等价环境，保留 env var 扩展与 AUTO 缺变量跳过语义）；lock 快照读取 `PluginLockService` 对应路径：在线且文件缺失时沿用现有「从 Hub 获取」行为；`offline=True` 时严禁 Hub 访问，lock 缺失抛 `InstallResolutionError(MeltanoError)`（可操作 instruction）。
+++    - plan_id = sha256(canonical JSON of {plugin_type, plugin_dir_name, variant, sorted(set(pip_install_args)), python, lock_hash})，键序固定。
+++    - 提供 `truthy_offline`（解析 `MELTANO_OFFLINE`：1/true/yes/on）。
+++  - 新增错误类（`InstallTransactionError(MeltanoError)` 及 `InstallResolutionError`、`StalePlanError`、`StagingBuildError`、`ExecutabilityCheckError`、`OfflineUnavailableError`），集中在包内 errors 模块，全部带 instruction。
+++- **Acceptance Criteria Addressed**: AC-1, AC-11, AC-14
+++- **Test Requirements**:
+++  - `rule` TR-2.1: 相同输入两次解析 plan_id 相等；分别改动 pip_url、variant、lock 文件内容、python 后 plan_id 均改变；证据：参数化测试
+++  - `rule` TR-2.2: offline 解析不触发任何 Hub 调用（mock Hub 并断言零调用），lock 缺失时抛 `InstallResolutionError` 且含 instruction；证据：异常与 mock 断言
+++  - `rule` TR-2.3: `InstallPlan` 可 JSON 往返且字段无损；证据：序列化/反序列化相等断言
+++  - `rule` TR-2.4: `MELTANO_OFFLINE` 真值解析符合 1/true/yes/on 约定，其余为 False；证据：参数化测试
+++
+++## Task 3: 暂存构建器与可执行性检查（staging.py）
+++- **Status**: `completed`
+++- **Completion Evidence**:
+++  - TR-3.1~3.4 pass: `tests/meltano/core/install_transaction/test_staging.py` 9/9 通过；构建目标为暂存路径且最终 venv 不变；离线参数 uv `--offline` / pip `--no-index`(+find-links) 正确；真实临时 venv 中可执行性检查四参数化场景符合预期；deps marker 与指纹写入验证。
+++  - 扩展 [venv_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/venv_service.py) 支持 `venv_path` 覆盖；新增 [staging.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/staging.py)。
+++- **Priority**: high
+++- **Depends On**: Task 1, Task 2
+++- **Description**:
+++  - 扩展 [venv_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/venv_service.py)：`VenvBackend.from_plugin` 与 `VirtualEnvService.from_plugin` 增加可选 `venv_path: Path | None = None`（默认沿用 `project.dirs.venvs(...)`），使同一后端可构建到暂存根；log_path 保留在原 logs 目录。
+++  - 实现 `StagingBuilder`：
+++    - `prepare(plan)`：创建 `staging/<plan_id>/`；写 plan.json 与阶段 marker（`venv-created`/`deps-installed`/`checked`），使重启可判断进度。
+++    - `build(plan)`：在暂存 venv 执行 create + install；离线参数注入——uv 后端 args 前置 `--offline`；pip 后端 args 前置 `--no-index`（存在 `MELTANO_PIP_FIND_LINKS` 时追加 `--find-links`）；构建失败抛 `StagingBuildError`/`OfflineUnavailableError`。
+++    - `is_complete(plan)`：marker + 指纹判断，供复用。
+++  - 实现 `ExecutabilityChecker`：
+++    1. 暂存 `bin/python` 存在并执行 `-c "import sys"`（超时）；
+++    2. `venv.exec_path(plugin.executable)` 存在且 `os.access(X_OK)`；
+++    3. 以可执行文件运行 `--help`（超时，stdout/stderr 合并读取）；退出 0 通过，否则抛 `ExecutabilityCheckError`（含输出尾部）。
+++- **Acceptance Criteria Addressed**: AC-2, AC-3, AC-11
+++- **Test Requirements**:
+++  - `rule` TR-3.1: build 调用的后端目标路径 == 暂存 venv；最终 venv 在 build 前后无变化（快照对比）；证据：mock 后端参数 + 路径快照
+++  - `rule` TR-3.2: 离线 build 时 uv 调用含 `--offline`、pip 调用含 `--no-index`；证据：mock 调用参数断言
+++  - `rule` TR-3.3: 在真实临时 venv 中：正常脚本通过检查；缺可执行文件、`--help` 退出非 0、python 缺失三种构造分别抛对应错误；证据：checker 参数化测试
+++  - `rule` TR-3.4: build 成功后写出 `deps-installed` marker 且暂存指纹 == 计划指纹；证据：marker 与指纹断言
+++
+++## Task 4: 原子提交器（commit.py）
+++- **Status**: `completed`
+++- **Completion Evidence**:
+++  - TR-4.1~4.4 pass: `tests/meltano/core/install_transaction/test_commit.py` 4/4 通过；提交后 venv/install.json 与计划匹配且暂存/备份清除；stale plan 拒绝且不触盘；状态写入失败回滚旧版本并还原暂存；跨进程持锁时等待超时给出可操作错误。
+++  - 新增 [commit.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/commit.py)。
+++- **Priority**: high
+++- **Depends On**: Task 2, Task 3
+++- **Description**:
+++  - 实现 `InstallCommitter`：
+++    - 以 `fasteners.InterProcessLock(commit_lock_path)` 作为 per-plugin 提交锁（blocking 获取，带默认超时，超时抛可操作错误）。
+++    - `commit(plan)`：锁内先 `plan_service.resolve(...)` 复检——当前 plan_id 与暂存计划不一致即抛 `StalePlanError`（不切换）。
+++    - 切换序列（同卷 rename）：旧 venv → `venv.backup-<old_id>`（无旧版本则跳过）→ 暂存 venv → venv → 校验新 python 存在/指纹 → 候选 install.json（临时文件 + `os.replace` 原子落位）→ 校验通过后删除 backup；任何一步异常：存在 backup 则回滚 rename 恢复旧 venv、删除半成品，抛出并由调用方记录恢复。
+++    - install.json 内容：plan_id、插件身份、python、pip args、lock_hash、fingerprint、committed_at、meltano 版本。
+++  - 提供 `CommittedState` 读取模型（`load(paths)`，损坏/缺失返回 None）。
+++- **Acceptance Criteria Addressed**: AC-4, AC-7, AC-8
+++- **Test Requirements**:
+++  - `rule` TR-4.1: 提交后 venv 内容来自暂存、python 可运行、`install.json` 字段与计划完全匹配、暂存目录被清空；证据：提交器测试
+++  - `rule` TR-4.2: 复检发现当前 plan_id != 暂存 plan_id 时抛 `StalePlanError`，venv/install.json 均不变；证据：stale-plan 测试
+++  - `rule` TR-4.3: 在「venv 就位后、状态写入前」注入失败：backup 被回滚，最终 venv 与 install.json 仍为旧版本；证据：切换中途失败测试
+++  - `rule` TR-4.4: 同一 commit_lock_path 上两个获取者串行（线程模拟），第二个获取时重新复检；证据：锁行为测试
+++
+++## Task 5: 恢复协调器（recovery.py）
+++- **Status**: `completed`
+++- **Completion Evidence**:
+++  - TR-5.1~5.3 pass: `tests/meltano/core/install_transaction/test_recovery.py` 8/8 通过；失败记录字段完整、重名不覆盖；reconcile 覆盖 reusable/resumable/过期清理/损坏清理/切换回滚/备份清除；supersede 保留文件。
+++  - 新增 [recovery.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/recovery.py)。
+++- **Priority**: high
+++- **Depends On**: Task 1, Task 2, Task 4
+++- **Description**:
+++  - 实现 `RecoveryRecord`（dataclass）：record_id、plan_id、插件身份、失败阶段、原因、时间戳、staging 路径、previous_plan_id、状态（open/superseded）、建议；原子写入（tmp + os.replace）。
+++  - 实现 `RecoveryService`：
+++    - `record_failure(plan, stage, error, previous_plan_id)`：写 `recovery/<plan_id>-<timestamp>.json`（文件名可识别、不覆盖既有记录）。
+++    - `list_open()` / `supersede_for(plugin)`：新成功提交后将同插件 open 记录标记 superseded（不删除）。
+++    - `reconcile(plugin) -> ReconcileResult`：
+++      1. 发现 `venv.backup-*` 且 venv 缺失/损坏 → 回滚恢复 backup；venv 完好而 backup 残留 → 删除 backup；
+++      2. 扫描 staging/：与当前 plan_id 相同 → 校验 marker/指纹，返回 reusable（完整）或 resumable（不完整）；其他 plan_id 或损坏 → rmtree；
+++      3. 汇总 open recovery 记录并在日志输出路径。
+++- **Acceptance Criteria Addressed**: AC-5, AC-6
+++- **Test Requirements**:
+++  - `rule` TR-5.1: `record_failure` 写出的 JSON 字段完整可解析，重复失败产生不同文件名（不覆盖）；证据：记录内容与文件数断言
+++  - `rule` TR-5.2: 完整同计划暂存 → reusable 且无 pip 调用；不完整 → resumable；异计划/损坏 → 目录被删除；四种切换残留情形按规格恢复；证据：reconcile 参数化测试（对应 AC-6 四情形）
+++  - `rule` TR-5.3: 成功提交后旧 open 记录变为 superseded 但文件仍存在；证据：状态字段断言
+++
+++## Task 6: 事务编排与 PluginInstallService 接入（transaction.py + service 改造）
+++- **Status**: `completed`
+++- **Completion Evidence**:
+++  - TR-6.1~6.5 pass: `test_transaction.py` 8 项 + 既有 `test_plugin_install_service.py` 20 项通过；快速路径零 pip 调用、dry-run 目录树无变化、三阶段失败注入保留旧版本且 recovery 完整、首次安装失败可重试、并发单提交者/异插件并行均验证。连续 5 次随机顺序 52/52 稳定。
+++  - 新增 [transaction.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/install_transaction/transaction.py)；改造 [plugin_install_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/plugin_install_service.py)。
+++- **Priority**: high
+++- **Depends On**: Task 2, Task 3, Task 4, Task 5
+++- **Description**:
+++  - 实现 `InstallTransaction` 编排单插件事务：`recovery.reconcile` → fast-path 判定（CommittedState.plan_id == 当前 plan_id 且 venv python 存在、指纹匹配 → SKIPPED）→ 按 reusable/resumable 复用或 `staging.build` → `ExecutabilityChecker` → `committer.commit` → hooks → `recovery.supersede_for`；各阶段异常统一：保留旧版本（首次安装无旧版本时保留无 venv 状态）、`record_failure`、返回 ERROR 状态与可操作消息。
+++  - 改造 [plugin_install_service.py](file:///Users/ding/Documents/swe/09224/project-07/src/meltano/core/plugin_install_service.py)：
+++    - `__init__` 增加 `dry_run: bool = False`、`offline: bool = False`（offline 可由 MELTANO_OFFLINE 初始化）。
+++    - `install_plugin_async`：保留全局 semaphore 与 `remove_duplicates`；dry-run 仅 resolve + 产出 RUNNING/SKIPPED 状态后返回，全程不触盘；非 dry-run 走 `InstallTransaction`。
+++    - hooks：成功提交后触发 `trigger_hooks("install", ...)`（语义不变，hook 失败 → WARNING）。
+++    - `_requires_install` 逻辑由 fast-path/计划复用取代（AUTO 缺 env var 跳过语义保留在 resolve 阶段）。
+++  - 模块级 `install_plugins(...)` helper 增加 `dry_run`/`offline` kwarg（默认 False，向后兼容），保持返回 bool。
+++- **Acceptance Criteria Addressed**: AC-5, AC-6, AC-8, AC-9, AC-10, AC-12, AC-13, AC-14, AC-15
+++- **Test Requirements**:
+++  - `rule` TR-6.1: fast-path 条件满足时无暂存目录、无 pip/uv 调用、状态 SKIPPED；证据：mock 零调用 + 状态断言
+++  - `rule` TR-6.2: dry-run 全流程无文件/目录产生（项目前后文件树 diff 为空）、无子进程，状态含将执行动作；证据：快照对比
+++  - `rule` TR-6.
+\ No newline at end of file
 diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
 new file mode 100644
 index 000000000..a8f762503
