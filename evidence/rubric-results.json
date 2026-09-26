@@ -12,7 +12,7 @@
   {
     "id": 3,
     "passed": false,
-    "reason": "remove commit 由配置、lock、cache 等多次文件操作组成；rollback 异常只记录，journal 清理仍可继续。"
+    "reason": "移除提交由配置、锁文件和缓存等多次文件操作组成；回滚异常只记录，日志清理仍可继续。"
   },
   {
     "id": 4,
@@ -22,12 +22,12 @@
   {
     "id": 5,
     "passed": false,
-    "reason": "清理错误被记录后结果仍从 managers 状态返回，没有将失败资源及待续做状态反映到调用结果。"
+    "reason": "清理错误被记录后结果仍从管理器状态返回，没有将失败资源及待续做状态反映到调用结果。"
   },
   {
     "id": 6,
     "passed": false,
-    "reason": "_finish_commit_steps 以缺失文件和 moved journal 标记推断清理完成；文件移动与 journal 更新分属不同操作。"
+    "reason": "完成提交步骤以缺失文件和已移动日志标记判断清理完成；文件移动与日志更新分属不同操作。"
   },
   {
     "id": 7,
