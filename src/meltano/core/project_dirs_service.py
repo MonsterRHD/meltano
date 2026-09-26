@@ -20,6 +20,18 @@ if t.TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+#: Name of the pointer file, under the project plugins dir, that records the
+#: currently published lock snapshot.
+LOCK_SNAPSHOT_POINTER_FILENAME = "lock.snapshot.json"
+#: Directory name, under the project plugins dir, that holds lock snapshots.
+LOCK_SNAPSHOTS_DIRNAME = "snapshots"
+#: Directory name, under the project sys dir, that holds lock batch data.
+LOCK_STAGING_DIRNAME = "lock"
+#: Directory name under the lock dir that holds batch staging directories.
+LOCK_STAGING_STATES_DIRNAME = "staging"
+#: File name, under the sys run dir, of the batch publish interprocess lock.
+LOCK_BATCH_LOCK_FILENAME = "lock-snapshot.lock"
+
 
 @dataclass
 class ProjectDirsService:
@@ -254,3 +266,49 @@ class ProjectDirsService:
             f"{filename}.lock",
             make_dirs=make_dirs,
         )
+
+    def plugin_lock_snapshot_pointer(self) -> Path:
+        """Path to the pointer file that records the published lock snapshot.
+
+        Returns:
+            Path to the lock snapshot pointer.
+        """
+        return self.root_dir("plugins", LOCK_SNAPSHOT_POINTER_FILENAME)
+
+    def plugin_lock_snapshots_dir(self, *joinpaths: StrPath) -> Path:
+        """Path to the directory (or a path under it) holding lock snapshots.
+
+        Args:
+            joinpaths: Paths to join to the snapshots directory.
+
+        Returns:
+            Path to the lock snapshots directory.
+        """
+        return self.root_dir(
+            "plugins",
+            LOCK_SNAPSHOTS_DIRNAME,
+            *joinpaths,
+        )
+
+    def plugin_lock_staging_dir(self, *joinpaths: StrPath) -> Path:
+        """Path to the directory (or a path under it) holding batch staging.
+
+        Args:
+            joinpaths: Paths to join to the staging directory.
+
+        Returns:
+            Path to the lock staging directory.
+        """
+        return self.sys_dir.joinpath(
+            LOCK_STAGING_DIRNAME,
+            LOCK_STAGING_STATES_DIRNAME,
+            *joinpaths,
+        )
+
+    def plugin_lock_batch_lock_path(self) -> Path:
+        """Path to the interprocess lock serializing snapshot publication.
+
+        Returns:
+            Path to the batch publish interprocess lock file.
+        """
+        return self.sys_dir.joinpath("run", LOCK_BATCH_LOCK_FILENAME)

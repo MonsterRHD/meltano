@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from structlog.stdlib import get_logger
 
+from meltano.core.lock_snapshot_service import LockSnapshotService
 from meltano.core.plugin.base import PluginDefinition, StandalonePlugin
 
 if t.TYPE_CHECKING:
@@ -189,6 +190,39 @@ class PluginLockService:
 
         return self._save_from_project_plugin(plugin=plugin, exists_ok=exists_ok)
 
+    def _snapshot_content(
+        self,
+        *,
+        plugin_type: PluginType,
+        plugin_name: str,
+        variant_name: str | None = None,
+    ) -> tuple[dict[str, t.Any], VariantMetadata] | None:
+        """Load lock content from the published snapshot, when one lists it."""
+        manifest = LockSnapshotService(self.project).read_manifest()
+        if manifest is None:
+            return None
+
+        entry = manifest.find_entry(
+            plugin_type=plugin_type.value,
+            plugin_name=plugin_name,
+            variant_name=variant_name,
+        )
+        if entry is None or entry.file is None:
+            # Not in the snapshot, or listed but not a readable lock (e.g.
+            # an inherited entry): fall back to the loose lock path.
+            return None
+
+        path = self.project.root / entry.file
+        try:
+            content = json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+
+        return content, VariantMetadata(
+            is_default=entry.is_default_variant,
+            is_deprecated=entry.is_deprecated,
+        )
+
     def load_content(
         self,
         *,
@@ -197,6 +231,14 @@ class PluginLockService:
         variant_name: str | None = None,
     ) -> tuple[dict[str, t.Any], VariantMetadata]:
         """Load the content of the plugin lockfile."""
+        snapshot = self._snapshot_content(
+            plugin_type=plugin_type,
+            plugin_name=plugin_name,
+            variant_name=variant_name,
+        )
+        if snapshot is not None:
+            return snapshot
+
         variant_metadata = VariantMetadata()
         path = self.lock_path(
             plugin_type=plugin_type,
@@ -216,6 +258,14 @@ class PluginLockService:
 
     def get_standalone_data(self, plugin: ProjectPlugin) -> dict[str, t.Any]:
         """Get the standalone data for a plugin."""
+        snapshot = self._snapshot_content(
+            plugin_type=plugin.type,
+            plugin_name=plugin.inherit_from or plugin.name,
+            variant_name=plugin.variant,
+        )
+        if snapshot is not None:
+            return snapshot[0]
+
         path = self.lock_path(
             plugin_type=plugin.type,
             plugin_name=plugin.inherit_from or plugin.name,
