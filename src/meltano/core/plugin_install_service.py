@@ -8,6 +8,7 @@ import functools
 import logging
 import os
 import shlex
+import shutil
 import sys
 import typing as t
 from dataclasses import dataclass
@@ -21,6 +22,15 @@ from meltano.core.error import (
     PluginInstallError,
     PluginInstallWarning,
 )
+from meltano.core.install_transaction.commit import InstallCommitter
+from meltano.core.install_transaction.errors import InstallTransactionError
+from meltano.core.install_transaction.paths import InstallPaths
+from meltano.core.install_transaction.plan import (
+    InstallPlan,
+    InstallPlanService,
+    offline_from_env,
+)
+from meltano.core.install_transaction.transaction import InstallTransaction
 from meltano.core.plugin.settings_service import PluginSettingsService
 from meltano.core.settings_service import FeatureFlags
 from meltano.core.utils import (
@@ -167,6 +177,8 @@ class PluginInstallService:
         parallelism: int | None = None,
         clean: bool = False,
         force: bool = False,
+        dry_run: bool = False,
+        offline: bool | None = None,
     ):
         """Initialize new PluginInstallService instance.
 
@@ -176,12 +188,17 @@ class PluginInstallService:
             parallelism: Number of parallel installation processes to use.
             clean: Clean install flag.
             force: Whether to ignore the Python version required by plugins.
+            dry_run: Resolve and report plans without writing to disk.
+            offline: Only use locked, locally available artifacts. When `None`,
+                the `MELTANO_OFFLINE` environment variable is consulted.
         """
         self.project = project
         self.status_cb = status_cb
         self._parallelism = parallelism
         self.clean = clean
         self.force = force
+        self.dry_run = dry_run
+        self.offline = offline if offline is not None else offline_from_env()
 
     @cached_property
     def parallelism(self) -> int:
@@ -321,16 +338,51 @@ class PluginInstallService:
         Returns:
             PluginInstallState state instance.
         """
-        env = self.plugin_installation_env(plugin)
-
-        requires_install, message = self._requires_install(plugin, reason, env=env)
-        if not requires_install:
+        if not plugin.is_installable():
             state = PluginInstallState(
                 plugin=plugin,
                 reason=reason,
                 status=PluginInstallStatus.SKIPPED,
-                message=message,
+                message="Plugin is not installable",
             )
+            self.status_cb(state)
+            return state
+
+        if reason is not PluginInstallReason.AUTO and plugin.is_mapping():
+            state = PluginInstallState(
+                plugin=plugin,
+                reason=reason,
+                status=PluginInstallStatus.SKIPPED,
+                message="Plugin is a mapping",
+            )
+            self.status_cb(state)
+            return state
+
+        plan_service = InstallPlanService(self.project)
+
+        try:
+            plan = plan_service.resolve(plugin, reason, offline=self.offline)
+        except EnvironmentVariableNotSetError:
+            state = PluginInstallState(
+                plugin=plugin,
+                reason=reason,
+                status=PluginInstallStatus.SKIPPED,
+                message="Missing environment variable",
+            )
+            self.status_cb(state)
+            return state
+        except InstallTransactionError as err:
+            state = PluginInstallState(
+                plugin=plugin,
+                reason=reason,
+                status=PluginInstallStatus.ERROR,
+                message=str(err),
+            )
+            self.status_cb(state)
+            return state
+
+        if self.dry_run:
+            state = self._dry_run_state(plugin, reason, plan, plan_service)
             self.status_cb(state)
             return state
 
@@ -342,39 +394,34 @@ class PluginInstallService:
             ),
         )
 
+        if self.clean:
+            paths = InstallPaths(self.project, plugin)
+            shutil.rmtree(paths.venv, ignore_errors=True)
+            if paths.state_path.exists():
+                paths.state_path.unlink()
+
+        transaction = InstallTransaction(
+            self.project,
+            plan_service=plan_service,
+        )
         try:
-            async with plugin.trigger_hooks("install", self, plugin, reason):
-                installer: PluginInstaller = getattr(
+            if reason is PluginInstallReason.AUTO:
+                outcome = await transaction.execute(
                     plugin,
-                    "installer",
-                    install_pip_plugin,
-                )
-                await installer(
-                    project=self.project,
-                    plugin=plugin,
-                    reason=reason,
-                    clean=self.clean,
+                    reason,
+                    offline=self.offline,
                     force=self.force,
-                    env=env,
                 )
-                state = PluginInstallState(
-                    plugin=plugin,
-                    reason=reason,
-                    status=PluginInstallStatus.SUCCESS,
-                )
-                self.status_cb(state)
-                return state
-
-        except PluginInstallError as err:
-            state = PluginInstallState(
-                plugin=plugin,
-                reason=reason,
-                status=PluginInstallStatus.ERROR,
-                message=str(err),
-            )
-            self.status_cb(state)
-            return state
-
+            else:
+                # Hooks (e.g. File plugin `after_install`) wrap the explicit
+                # install, so they fire even on the no-change fast path.
+                async with plugin.trigger_hooks("install", self, plugin, reason):
+                    outcome = await transaction.execute(
+                        plugin,
+                        reason,
+                        offline=self.offline,
+                        force=self.force,
+                    )
         except PluginInstallWarning as warn:
             state = PluginInstallState(
                 plugin=plugin,
@@ -385,54 +432,62 @@ class PluginInstallService:
             self.status_cb(state)
             return state
 
-        except AsyncSubprocessError as err:
-            state = PluginInstallState(
-                plugin=plugin,
-                reason=reason,
-                status=PluginInstallStatus.ERROR,
-                message=str(err),
-                details=await err.stderr,
-            )
-            self.status_cb(state)
-            return state
+        match outcome.status:
+            case "success":
+                state = PluginInstallState(
+                    plugin=plugin,
+                    reason=reason,
+                    status=PluginInstallStatus.SUCCESS,
+                )
+            case "skipped":
+                state = PluginInstallState(
+                    plugin=plugin,
+                    reason=reason,
+                    status=PluginInstallStatus.SKIPPED,
+                    message=outcome.message,
+                )
+            case _:
+                state = PluginInstallState(
+                    plugin=plugin,
+                    reason=reason,
+                    status=PluginInstallStatus.ERROR,
+                    message=outcome.message,
+                )
+        self.status_cb(state)
+        return state
 
-    def _requires_install(
-        self,
+    @staticmethod
+    def _dry_run_state(
         plugin: ProjectPlugin,
         reason: PluginInstallReason,
-        *,
-        env: Mapping[str, str] | None = None,
-    ) -> tuple[bool, str]:
-        if not plugin.is_installable():
-            return False, "Plugin is not installable"
-
-        if reason is not PluginInstallReason.AUTO:
-            return not plugin.is_mapping(), "Plugin is a mapping"
-
-        try:
-            pip_install_args = get_pip_install_args(
-                self.project,
-                plugin,
-                env,
-                if_missing=EnvVarMissingBehavior.raise_exception,
-            )
-        except EnvironmentVariableNotSetError as e:
-            logger.warning(
-                (
-                    "Environment variable '%s' not set for '%s' `pip_url`, will not"
-                    " attempt install"
-                ),
-                e.env_var,
-                plugin.name,
-            )
-            message = "Missing environment variable"
-            return False, message
-
-        venv = VirtualEnv(
-            self.project.dirs.plugin(plugin, "venv", make_dirs=False),
-            python=plugin.python or self.project.settings.get("python"),
+        plan: InstallPlan,
+        plan_service: InstallPlanService,
+    ) -> PluginInstallState:
+        """Build the reported state for a dry run (no disk writes)."""
+        paths = InstallPaths(project=plan_service.project, plugin=plugin)
+        previous = InstallCommitter(
+            plan_service.project,
+            plan_service,
+        ).load_committed_state(plugin)
+        unchanged = (
+            previous is not None
+            and previous.plan_id == plan.plan_id
+            and VirtualEnv(paths.venv, python=plan.python).read_fingerprint()
+            == plan.fingerprint_value
         )
-        return venv.requires_install(pip_install_args), "Requirements have not changed"
+        if unchanged:
+            return PluginInstallState(
+                plugin=plugin,
+                reason=reason,
+                status=PluginInstallStatus.SKIPPED,
+                message="No changes required",
+            )
+        return PluginInstallState(
+            plugin=plugin,
+            reason=reason,
+            status=PluginInstallStatus.RUNNING,
+            message=f"Would install: {shlex.join(plan.pip_install_args)}",
+        )
 
     def plugin_installation_env(self, plugin: ProjectPlugin) -> dict[str, str]:
         """Environment variables to use during plugin installation.
@@ -583,6 +638,8 @@ async def install_plugins(
     parallelism: int | None = None,
     clean: bool = False,
     force: bool = False,
+    dry_run: bool = False,
+    offline: bool | None = None,
 ) -> bool:
     """Install the provided plugins and report results to the console."""
     install_service = PluginInstallService(
@@ -591,6 +648,8 @@ async def install_plugins(
         parallelism=parallelism,
         clean=clean,
         force=force,
+        dry_run=dry_run,
+        offline=offline,
     )
     install_results = await install_service.install_plugins(plugins, reason=reason)
     total = len(install_results)

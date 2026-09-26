@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": false,
+    "reason": "_move_path 在 EXDEV 分支先 copytree 到公开目标，再 rmtree 源目录。"
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "_rollback 捕获 OSError 后只记 critical 日志；外层清理仍删除 journal。"
+  },
+  {
+    "id": 5,
+    "passed": false,
+    "reason": "EXDEV fallback 通过 copytree/rmtree 逐项复制，没有原子 rename 替换目标的步骤。"
+  },
+  {
+    "id": 6,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 8,
+    "passed": true,
+    "reason": ""
+  }
+]

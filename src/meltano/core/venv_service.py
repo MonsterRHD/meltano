@@ -496,6 +496,7 @@ class VirtualEnvService:
         plugin: ProjectPlugin,
         *,
         backend_class: type[VenvBackend] | None = None,
+        venv_path: Path | None = None,
     ) -> Self:
         """Create a service instance from a project and plugin.
 
@@ -504,6 +505,8 @@ class VirtualEnvService:
             plugin: The plugin to create a service instance for.
             backend_class: The backend class to use. Defaults to the class
                 selected by the ``venv.backend`` project setting.
+            venv_path: Override the virtual environment root, e.g. to build in
+                a staging directory. Defaults to the committed venv path.
 
         Returns:
             A service instance.
@@ -516,7 +519,7 @@ class VirtualEnvService:
             project=project,
             namespace=plugin.type,
             name=plugin.plugin_dir_name,
-            backend=backend_class.from_plugin(project, plugin),
+            backend=backend_class.from_plugin(project, plugin, venv_path=venv_path),
         )
 
     @property
@@ -680,22 +683,30 @@ class VenvBackend(abc.ABC):
         cls,
         project: Project,
         plugin: ProjectPlugin,
+        *,
+        venv_path: Path | None = None,
     ) -> Self:
         """Create a service instance from a project and plugin.
 
         Args:
             project: The Meltano project.
             plugin: The plugin to create a service instance for.
+            venv_path: Override the virtual environment root, e.g. to build in
+                a staging directory.
 
         Returns:
             A service instance.
         """
         namespace = plugin.type
         name = plugin.plugin_dir_name
-        venv_path = project.dirs.venvs(namespace, name, make_dirs=False)
+        resolved_venv_path = venv_path or project.dirs.venvs(
+            namespace,
+            name,
+            make_dirs=False,
+        )
         log_path = project.dirs.logs("pip", namespace, name, "install.log").resolve()
         venv = VirtualEnv(
-            venv_path,
+            resolved_venv_path,
             python=(
                 plugin.python
                 or project.settings.get("python")

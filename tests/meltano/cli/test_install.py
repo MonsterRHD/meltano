@@ -35,6 +35,8 @@ class TestCliInstall:
                 parallelism=None,
                 clean=False,
                 force=False,
+                dry_run=False,
+                offline=None,
             )
 
     @pytest.mark.usefixtures("dbt")
@@ -57,7 +59,13 @@ class TestCliInstall:
             call_args = install_plugin_mock_e.call_args
             assert call_args[0][0] == project
             assert set(call_args[0][1]) == {tap, tap_gitlab}
-            assert call_args[1] == {"parallelism": None, "clean": False, "force": False}
+            assert call_args[1] == {
+                "parallelism": None,
+                "clean": False,
+                "force": False,
+                "dry_run": False,
+                "offline": None,
+            }
 
         with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock_l:
             install_plugin_mock_l.return_value = True
@@ -71,6 +79,8 @@ class TestCliInstall:
                 parallelism=None,
                 clean=False,
                 force=False,
+                dry_run=False,
+                offline=None,
             )
 
         with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock_m:
@@ -114,6 +124,8 @@ class TestCliInstall:
                 parallelism=None,
                 clean=False,
                 force=False,
+                dry_run=False,
+                offline=None,
             )
 
         with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock_l:
@@ -131,6 +143,8 @@ class TestCliInstall:
                 parallelism=None,
                 clean=False,
                 force=False,
+                dry_run=False,
+                offline=None,
             )
 
         with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock_m:
@@ -168,7 +182,13 @@ class TestCliInstall:
             call_args = install_plugin_mock.call_args
             assert call_args[0][0] == project
             assert set(call_args[0][1]) == {tap, tap_gitlab}
-            assert call_args[1] == {"parallelism": None, "clean": False, "force": False}
+            assert call_args[1] == {
+                "parallelism": None,
+                "clean": False,
+                "force": False,
+                "dry_run": False,
+                "offline": None,
+            }
 
     @pytest.mark.usefixtures("dbt")
     def test_install_multiple_any_type(
@@ -193,6 +213,8 @@ class TestCliInstall:
                 parallelism=None,
                 clean=False,
                 force=False,
+                dry_run=False,
+                offline=None,
             )
 
     def test_install_parallel(
@@ -266,6 +288,44 @@ class TestCliInstall:
 
             mappers = [m for m in commands[0][1] if m == mapper]
             assert len(mappers) == 1
+
+    def test_dry_run_option(
+        self,
+        project,
+        tap,
+        cli_runner,
+    ) -> None:
+        with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock:
+            install_plugin_mock.return_value = True
+            result = cli_runner.invoke(cli, ["install", "--dry-run"])
+            assert_cli_runner(result)
+            assert install_plugin_mock.call_args.kwargs["dry_run"] is True
+
+    def test_offline_option(
+        self,
+        project,
+        tap,
+        cli_runner,
+    ) -> None:
+        with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock:
+            install_plugin_mock.return_value = True
+            result = cli_runner.invoke(cli, ["install", "--offline"])
+            assert_cli_runner(result)
+            assert install_plugin_mock.call_args.kwargs["offline"] is True
+
+    def test_offline_env_var(
+        self,
+        project,
+        tap,
+        cli_runner,
+        monkeypatch,
+    ) -> None:
+        monkeypatch.setenv("MELTANO_OFFLINE", "true")
+        with mock.patch("meltano.cli.install.install_plugins") as install_plugin_mock:
+            install_plugin_mock.return_value = True
+            result = cli_runner.invoke(cli, ["install"])
+            assert_cli_runner(result)
+            assert install_plugin_mock.call_args.kwargs["offline"] is True
 
     @pytest.mark.usefixtures("tap_gitlab", "target")
     def test_install_schedule(

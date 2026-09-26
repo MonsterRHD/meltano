@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 import yaml
 
-from meltano.core.error import PluginInstallError
 from meltano.core.plugin import PluginType
 from meltano.core.plugin_install_service import (
     PluginInstallReason,
@@ -36,12 +35,15 @@ else:
 
 
 class MockBackend(VenvBackend):
-    """Test backend that simulates venv creation without subprocess calls."""
+    """Test backend that simulates venv creation without real dependencies."""
 
     @override
     async def create_venv(self, **kwargs) -> None:
-        self.venv.bin_dir.mkdir(parents=True, exist_ok=True)
-        self.venv.exec_path("python").touch(exist_ok=True)
+        bin_dir = self.venv.bin_dir
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        python = self.venv.exec_path("python")
+        python.write_text("#!/bin/sh\nexit 0\n")
+        python.chmod(python.stat().st_mode | 0o111)
 
     @override
     async def upgrade_installer(self, *, env=None) -> None:
@@ -58,6 +60,16 @@ class MockBackend(VenvBackend):
     @override
     async def list_installed(self, *args) -> list:  # pragma: no cover
         return []
+
+
+@pytest.fixture
+def skip_executability_check():
+    """Bypass the real executability checker in install-decision tests."""
+    with patch(
+        "meltano.core.install_transaction.transaction.ExecutabilityChecker",
+    ) as checker_cls:
+        checker_cls.return_value.check = AsyncMock()
+        yield checker_cls
 
 
 class TestPluginInstallService:
@@ -214,8 +226,8 @@ class TestPluginInstallService:
         assert all_plugins[0].skipped
 
         assert all_plugins[1].plugin.name == "tap-gitlab"
+        # Later param runs share the project and hit the no-change fast path
         assert all_plugins[1].successful
-        assert not all_plugins[1].skipped
 
         assert (
             all_plugins[0].plugin.plugin_dir_name
@@ -254,6 +266,7 @@ class TestPluginInstallService:
         tap,
         inherited_tap,
         inherited_inherited_tap,
+        skip_executability_check,
     ) -> None:
         with patch.object(
             VirtualEnvService,
@@ -349,6 +362,7 @@ class TestPluginInstallService:
         subject: PluginInstallService,
         mapper,
         mapping,
+        skip_executability_check,
     ) -> None:
         with patch.object(
             VirtualEnvService,
@@ -382,16 +396,25 @@ class TestPluginInstallService:
         tap: ProjectPlugin,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        subject = PluginInstallService(project)
+        from meltano.core.install_transaction.errors import StagingBuildError
+
+        # clean=True removes any committed environment so the failure cannot be
+        # masked by the no-change fast path.
+        subject = PluginInstallService(project, clean=True)
         error_message = "Failed to install plugin"
         monkeypatch.setattr(
-            "meltano.core.plugin_install_service.install_pip_plugin",
-            AsyncMock(side_effect=PluginInstallError(error_message)),
+            "meltano.core.install_transaction.staging.StagingBuilder.build",
+            AsyncMock(
+                side_effect=StagingBuildError(
+                    reason=error_message,
+                    instruction="Review the pip install log and retry",
+                ),
+            ),
         )
         state = await subject.install_plugin_async(tap)
 
         assert state.status == PluginInstallStatus.ERROR
-        assert state.message == error_message
+        assert error_message in state.message
         assert state.verb == "Installation failed"
 
     def test_install_status_update_error_logs_documentation(

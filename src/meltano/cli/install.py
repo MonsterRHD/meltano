@@ -50,6 +50,19 @@ logger = structlog.getLogger(__name__)
     help="Ignore the required Python version declared by the plugins.",
 )
 @click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Resolve and report the install plan without writing to disk.",
+)
+@click.option(
+    "--offline",
+    is_flag=True,
+    help=(
+        "Only use locked, locally available artifacts; don't fetch definitions "
+        "from the Hub. Alternatively set the MELTANO_OFFLINE environment variable."
+    ),
+)
+@click.option(
     "--schedule",
     "-s",
     "schedule_name",
@@ -67,6 +80,8 @@ async def install(
     clean: bool,
     parallelism: int,
     force: bool,
+    dry_run: bool,
+    offline: bool,
     schedule_name: str,
 ) -> None:
     """Install all the dependencies of your project based on the meltano.yml file.
@@ -102,12 +117,18 @@ async def install(
     )
     tracker.track_command_event(CliEvent.inflight)
 
+    from meltano.core.install_transaction.plan import offline_from_env
+
+    effective_offline = offline or offline_from_env()
+
     success = await install_plugins(
         project,
         plugins,
         parallelism=parallelism,
         clean=clean,
         force=force,
+        dry_run=dry_run,
+        offline=effective_offline or None,
     )
     if not success:
         tracker.track_command_event(CliEvent.failed)
