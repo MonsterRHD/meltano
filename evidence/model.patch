@@ -27,6 +27,9 @@ index d146eb077..7b6d94eb5 100644
  
  ### Examples
  
+diff --git a/evidence/model.patch b/evidence/model.patch
+new file mode 100644
+index 000000000..e69de29bb
 diff --git a/evidence/rubric-comparison.txt b/evidence/rubric-comparison.txt
 new file mode 100644
 index 000000000..8595856c0
